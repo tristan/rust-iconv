@@ -129,7 +129,6 @@ pub struct IconvReader<R> {
     buf: Vec<u8>,
     read_pos: usize,
     write_pos: usize,
-    err: Option<io::Error>,
     tempbuf: Vec<u8>,        // used when outbut is too small and can't make a single convertion
 }
 
@@ -140,28 +139,35 @@ impl<R:Read> IconvReader<R> {
         buf.extend(iter::repeat(0).take(DEFAULT_BUF_SIZE));
         IconvReader { inner: r, conv: conv,
                       buf: buf,
-                      read_pos: 0, write_pos: 0, err: None,
+                      read_pos: 0, write_pos: 0,
                       tempbuf: Vec::new(), // small buf allocate dynamicly
         }
     }
 
-    fn fill_buf(&mut self) {
-        if self.read_pos > 0 {
-            unsafe {
-                ptr::copy::<u8>(self.buf.as_mut_ptr(),
-                                mem::transmute(&self.buf[self.read_pos]),
-                                self.write_pos - self.read_pos);
-            }
+    pub fn with_capacity(r: R, from: &str, to: &str, capacity: usize) -> IconvReader<R> {
+        let conv = Converter::new(from, to);
+        let mut buf = Vec::with_capacity(capacity);
+        buf.extend(iter::repeat(0).take(capacity));
+        IconvReader { inner: r, conv: conv,
+                      buf: buf,
+                      read_pos: 0, write_pos: 0,
+                      tempbuf: Vec::new(), // small buf allocate dynamicly
+        }
+    }
 
+    fn fill_buf(&mut self) -> Result<usize> {
+        if self.read_pos > 0 {
+            self.buf.rotate_left(self.read_pos);
             self.write_pos -= self.read_pos;
             self.read_pos = 0;
         }
         match self.inner.read(&mut self.buf[self.write_pos..]) {
             Ok(nread) => {
                 self.write_pos += nread;
+                Ok(nread)
             }
             Err(e) => {
-                self.err = Some(e);
+                Err(e)
             }
         }
     }
@@ -184,31 +190,54 @@ impl<R:Read> Read for IconvReader<R> {
             return Ok(nwrite);
         }
 
-        while self.write_pos == 0 || self.read_pos == self.write_pos {
-            match self.err {
-                Some(ref e) =>  {
+        if self.write_pos == 0 || self.read_pos == self.write_pos {
+            match self.fill_buf() {
+                Err(e) =>  {
                     return Err(io::Error::new(e.kind(), ""));
                 },
-                None =>
-                    self.fill_buf()
+                Ok(read) => {
+                    if read == 0 {
+                        return Ok(0);
+                    }
+                }
             }
         }
 
-        let (nread, nwrite, err) = self.conv.convert(&self.buf[self.read_pos..self.write_pos], buf);
+        let (nread, nwrite, err) = self.conv.convert(
+            &self.buf[self.read_pos..self.write_pos],
+            buf);
 
         self.read_pos += nread;
 
         match err {
             EILSEQ => {
-                debug!("An invalid multibyte sequence has been encountered in the input.");
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, ""));
-            }
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "An invalid multibyte sequence has been encountered in the input."))
+            },
             EINVAL => {
-                debug!("An incomplete multibyte sequence has been encountered in the input.");
-                // FIXME fill_buf() here is ugly
-                self.fill_buf();
-                return Ok(nwrite);
-            }
+                match self.fill_buf() {
+                    Err(e) => {
+                        Err(io::Error::new(e.kind(), ""))
+                    },
+                    Ok(read) => {
+                        if read == 0 {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "An incomplete multibyte sequence has been encountered in the input."))
+                        } else {
+                            match self.read(&mut buf[nwrite..]) {
+                                Ok(nwrite_req) => {
+                                    Ok(nwrite + nwrite_req)
+                                },
+                                Err(e) => {
+                                    Err(io::Error::new(e.kind(), ""))
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             E2BIG => {
                 debug!("There is not sufficient room at *outbuf.");
                 // FIXED: if outbuf buffer has size 1? Can't hold a
@@ -217,8 +246,10 @@ impl<R:Read> Read for IconvReader<R> {
                     let mut tempbuf = Vec::with_capacity(8);
                     tempbuf.extend(iter::repeat(0u8).take(8));
                     assert!(self.tempbuf.is_empty());
-                    let (nread, temp_nwrite, err) = self.conv.convert(&self.buf[self.read_pos..self.write_pos], &mut tempbuf[..]);
-                    self.read_pos += nread;
+                    let (_nread, temp_nwrite, err) = self.conv.convert(
+                        &self.buf[self.read_pos..self.write_pos],
+                        &mut tempbuf[..]);
+
                     // here we will write 1 or 2 bytes as most.
                     // try avoiding return Ok(0)
                     let mut nwrite = 0;
@@ -229,16 +260,20 @@ impl<R:Read> Read for IconvReader<R> {
                     //buf.clone_from_slice(tempbuf.as_slice());
                     self.tempbuf = tempbuf[nwrite..temp_nwrite].to_vec();
                     match err {
-                        EILSEQ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "")),
-                        _ => return Ok(nwrite),
+                        EILSEQ => Err(io::Error::new(io::ErrorKind::InvalidInput, "")),
+                        _ => Ok(nwrite)
                     }
+                } else {
+                    Ok(nwrite)
                 }
-                return Ok(nwrite);
-            }
+            },
             0 => {
-                return Ok(nwrite);
+                Ok(nwrite)
+            },
+            _ => {
+                Err(io::Error::new(io::ErrorKind::Other,
+                                   format!("Unexpected error response: {}", err)))
             }
-            _ => unreachable!()
         }
     }
 }
@@ -373,23 +408,62 @@ mod test {
 
     use super::*;
 
-    // #[test]
-    fn test_reader() {
+    #[test]
+    fn test_reader_simple() {
         let a = "噗哈";
-        let cont = iter::repeat(a).take(1024).collect::<Vec<&str>>().connect("");
+        let r = BufReader::new(a.as_bytes());
+        let mut cr = IconvReader::with_capacity(r, "UTF-8", "GBK", 100);
+
+        let mut buf = [0u8; 8];
+        let res = cr.read(&mut buf);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 4);
+        assert_eq!(buf, vec![0xe0, 0xdb, 0xb9, 0xfe, 0, 0, 0, 0][..]);
+    }
+
+    #[test]
+    fn test_reader_small_buf() {
+        let a = "噗哈";
+        let r = BufReader::new(a.as_bytes());
+        let mut cr = IconvReader::with_capacity(r, "UTF-8", "GBK", 100);
+
+        let mut buf = [0u8; 3];
+        let res = cr.read(&mut buf);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(buf, vec![0xe0, 0xdb, 0][..]);
+
+        let mut buf = [0u8; 3];
+        let res = cr.read(&mut buf);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(buf, vec![0xb9, 0xfe, 0][..]);
+    }
+
+    #[test]
+    fn test_reader_large() {
+        let a = "噗哈";
+        let cont = iter::repeat(a).take(1024).collect::<Vec<&str>>().join("");
 
         let r = BufReader::new(cont.as_bytes());
-        let mut cr = IconvReader::new(r, "UTF-8", "GBK");
+        let mut cr = IconvReader::with_capacity(r, "UTF-8", "GBK", 100);
 
         let mut nread = 0;
         loop {
             let mut buf = [0u8; 4];
             let res = cr.read(&mut buf[..]);
             match res {
-                Ok(n) if n == 4 => {
-                    println!("nread = {}", nread);
-                    assert_eq!(buf, &vec!(224, 219, 185, 254)[..]);
-                    nread += 4;
+                Ok(n) => {
+                    if n == 4 {
+                        //println!("nread = {}", nread);
+                        assert_eq!(buf, &vec!(224, 219, 185, 254)[..]);
+                        nread += 4;
+                    } else if n == 0 {
+                        break;
+                    } else {
+                        println!("{}", n);
+                        unreachable!();
+                    }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::InvalidInput => {
                     return ;
@@ -404,13 +478,96 @@ mod test {
     }
 
     #[test]
+    fn test_reader_text() {
+        let text_shiftjis = vec![
+            0x91, 0xb1, 0x82, 0xda, 0x82, 0xd0, 0x82, 0xaf, 0x82, 0xd4, 0x93, 0xfa,
+            0x33, 0x8d, 0xcf, 0x82, 0xc8, 0x82, 0xc4, 0x82, 0xd0, 0x97, 0xac, 0x8a,
+            0xfa, 0x82, 0xbf, 0x82, 0xc8, 0x8b, 0xd6, 0x95, 0x90, 0x83, 0x91, 0x83,
+            0x5a, 0x83, 0x77, 0x83, 0x6c, 0x8e, 0xf1, 0x32, 0x33, 0x94, 0xcc, 0x94,
+            0xad, 0x83, 0x89, 0x83, 0x6d, 0x83, 0x8f, 0x95, 0xf1, 0x8b, 0x9e, 0x82,
+            0xd4, 0x82, 0xb9, 0x8c, 0x76, 0x8b, 0xb3, 0x83, 0x92, 0x83, 0x6a, 0x83,
+            0x86, 0x83, 0x54, 0x96, 0xda, 0x93, 0x8a, 0x33, 0x39, 0x8d, 0xec, 0x83,
+            0x56, 0x83, 0x8f, 0x83, 0x6a, 0x90, 0xbc, 0x38, 0x8a, 0x65, 0x94, 0x40,
+            0x82, 0xcb, 0x81, 0x42, 0x8e, 0xbf, 0x83, 0x8b, 0x83, 0x80, 0x83, 0x74,
+            0x83, 0x6c, 0x91, 0x66, 0x94, 0x4d, 0x82, 0xc6, 0x82, 0xeb, 0x82, 0xe2,
+            0x8c, 0xa0, 0x8e, 0xca, 0x83, 0x43, 0x83, 0x8b, 0x83, 0x54, 0x8f, 0xab,
+            0x90, 0x7d, 0x8c, 0x7c, 0x83, 0x60, 0x83, 0x58, 0x83, 0x71, 0x83, 0x5a,
+            0x97, 0x56, 0x8f, 0x9c, 0x82, 0xc8, 0x82, 0xea, 0x83, 0x43, 0x82, 0xd0,
+            0x93, 0xfa, 0x8c, 0xa9, 0x83, 0x8a, 0x83, 0x88, 0x90, 0x4d, 0x8a, 0xfa,
+            0x96, 0x68, 0x96, 0xc5, 0x95, 0x5b, 0x82, 0xad, 0x82, 0xa2, 0x89, 0x9f,
+            0x8a, 0xd6, 0x95, 0xc4, 0x83, 0x6e, 0x95, 0x4b, 0x94, 0x5c, 0x82, 0xdf,
+            0x83, 0x8c, 0x82, 0xce, 0x89, 0xef, 0x32, 0x8a, 0x65, 0x83, 0x93, 0x83,
+            0x74, 0x82, 0xa9, 0x94, 0x4f, 0x89, 0xbb, 0x82, 0xd4, 0x82, 0xa9, 0x82,
+            0xdf, 0x82, 0xf1, 0x93, 0xfc, 0x95, 0xc4, 0x83, 0x60, 0x83, 0x89, 0x83,
+            0x8b, 0x83, 0x8a, 0x94, 0xf2, 0x89, 0x80, 0x95, 0xd4, 0x8e, 0xf7, 0x82,
+            0xda, 0x82, 0xcb, 0x82, 0xa6, 0x81, 0x42, 0x8c, 0x9b, 0x82, 0xed, 0x83,
+            0x74, 0x91, 0xd1, 0x90, 0xa3, 0x94, 0xf1, 0x82, 0xc7, 0x82, 0xd9, 0x82,
+            0xe7, 0x8d, 0xe0, 0x88, 0xc4, 0x82, 0xb4, 0x82, 0xb7, 0x82, 0xab, 0x8d,
+            0xe3, 0x97, 0x59, 0x89, 0xef, 0x83, 0x65, 0x83, 0x4e, 0x83, 0x7d, 0x83,
+            0x86, 0x93, 0xfa, 0x8c, 0x76, 0x83, 0x54, 0x8d, 0xac, 0x8e, 0x71, 0x82,
+            0xe8, 0x82, 0xcf, 0x92, 0xb2, 0x92, 0xb2, 0x82, 0xac, 0x82, 0xd0, 0x82,
+            0xcd, 0x90, 0x6c, 0x8e, 0xca, 0x82, 0xd0, 0x82, 0xda, 0x83, 0x93, 0x82,
+            0xab, 0x8a, 0x70, 0x8b, 0xc7, 0x83, 0x52, 0x8e, 0x77, 0x8e, 0xf9, 0x83,
+            0x5c, 0x83, 0x60, 0x83, 0x6a, 0x89, 0x9e, 0x8e, 0x71, 0x83, 0x56, 0x83,
+            0x6b, 0x83, 0x84, 0x8b, 0x9e, 0x8c, 0x8f, 0x82, 0xac, 0x82, 0xb6, 0x8e,
+            0xa1, 0x94, 0xad, 0x82, 0xe3, 0x8d, 0xe3, 0x97, 0x5a, 0x94, 0x56, 0x89,
+            0x9f, 0x82, 0xaa, 0x82, 0xe7, 0x82, 0xd3, 0x81, 0x42, 0xa, 0xa, 0x95,
+            0xe0, 0x82, 0xbb, 0x83, 0x93, 0x8e, 0x5a, 0x88, 0xe4, 0x82, 0xc9, 0x83,
+            0x8a, 0x82, 0xb1, 0x97, 0xcc, 0x89, 0x89, 0x82, 0xde, 0x82, 0xdd, 0x82,
+            0xb3, 0x8f, 0xe3, 0x89, 0x66, 0x82, 0xd6, 0x83, 0x68, 0x8b, 0xe0, 0x39,
+            0x93, 0xdc, 0x8e, 0xba, 0x82, 0xe9, 0x8a, 0xe2, 0x90, 0x6c, 0x83, 0x74,
+            0x92, 0xca, 0x8d, 0xda, 0x81, 0x5b, 0x83, 0x8b, 0x82, 0xe2, 0x83, 0x58,
+            0x94, 0xfc, 0x8e, 0xd0, 0x82, 0xbb, 0x82, 0xb6, 0x82, 0xb9, 0x94, 0x67,
+            0x96, 0x40, 0x90, 0xab, 0x83, 0x81, 0x90, 0xa2, 0x33, 0x88, 0xc0, 0x83,
+            0x89, 0x83, 0x45, 0x83, 0x56, 0x83, 0x65, 0x8a, 0xcc, 0x88, 0xf8, 0x83,
+            0x8c, 0x96, 0xca, 0x8f, 0x9e, 0x82, 0xe4, 0x82, 0xcb, 0x95, 0xd3, 0x8d,
+            0xf4, 0x83, 0x58, 0x83, 0x60, 0x83, 0x50, 0x83, 0x77, 0x90, 0x56, 0x8b,
+            0x49, 0x83, 0x80, 0x83, 0x8f, 0x83, 0x86, 0x8a, 0xd4, 0x95, 0xb7, 0x8e,
+            0xf9, 0x8d, 0x4e, 0x82, 0xd1, 0x83, 0x89, 0x82, 0xce, 0x82, 0xbb, 0x81,
+            0x42, 0x8f, 0x82, 0x83, 0x67, 0x83, 0x65, 0x95, 0xd4, 0x8d, 0x5a, 0x82,
+            0xb0, 0x82, 0xd9, 0x8d, 0xdb, 0x90, 0x4d, 0x8d, 0x90, 0x82, 0xc6, 0x82,
+            0xa6, 0x8e, 0x59, 0x93, 0x56, 0x83, 0x5e, 0x83, 0x63, 0x83, 0x43, 0x83,
+            0x74, 0x94, 0xfc, 0x91, 0xce, 0x96, 0xca, 0x83, 0x45, 0x83, 0x60, 0x8b,
+            0x4c, 0x95, 0x81, 0x82, 0xb7, 0x83, 0x67, 0x82, 0xcf, 0x8e, 0x6a, 0x8a,
+            0xe9, 0x95, 0x91, 0x83, 0x67, 0x83, 0x92, 0x83, 0x91, 0x83, 0x50, 0x93,
+            0x6e, 0x8c, 0x7c, 0x83, 0x67, 0x83, 0x8f, 0x8a, 0x88, 0x93, 0xac, 0x37,
+            0x88, 0x9f, 0x8d, 0xcb, 0x96, 0xc5, 0x8d, 0x69, 0x82, 0xe1, 0x82, 0xd1,
+            0x82, 0xa9, 0x82, 0xc1, 0x81, 0x42, 0x8f, 0x91, 0x83, 0x81, 0x8a, 0x7d,
+            0x95, 0x76, 0x82, 0xe4, 0x95, 0x48, 0x37, 0x32, 0x96, 0x6e, 0x83, 0x5c,
+            0x83, 0x54, 0x83, 0x47, 0x91, 0xb6, 0x90, 0x7d, 0x8e, 0xab, 0x82, 0xed,
+            0x82, 0xcf, 0x95, 0xb7, 0x8e, 0x8e, 0x83, 0x43, 0x82, 0xb9, 0x83, 0x68,
+            0x82, 0xde, 0x93, 0xc7, 0x96, 0xda, 0x89, 0xef, 0x83, 0x8c, 0x82, 0xe9,
+            0x82, 0xf1, 0x82, 0xad, 0x90, 0x45, 0x8a, 0xd4, 0x83, 0x4c, 0x83, 0x84,
+            0x83, 0x91, 0x8f, 0xe3, 0x93, 0xb9, 0x83, 0x8c, 0x82, 0xd2, 0x96, 0xf1,
+            0x33, 0x92, 0xf1, 0x83, 0x82, 0x95, 0xfb, 0x8f, 0xad, 0x82, 0xf1, 0x82,
+            0xb6, 0x83, 0x74, 0x92, 0xea, 0x8f, 0xc5, 0x96, 0xce, 0x94, 0xf7, 0x8e,
+            0x5f, 0x82, 0xc3, 0x82, 0xb5, 0x82, 0xd7, 0x81, 0x42
+        ];
+
+        let r = BufReader::new(&text_shiftjis[..]);
+        let mut cr = IconvReader::with_capacity(r, "SHIFT-JIS", "UTF-8", 512);
+
+        let mut buf = [0u8; 2048];
+        let len = cr.read(&mut buf).unwrap();
+        assert_eq!(buf[len..len+5], [0, 0, 0, 0, 0]);
+
+        let s = String::from_utf8(buf[..len].to_vec()).unwrap();
+
+        assert_eq!(s,r#"続ぼひけぶ日3済なてひ流期ちな禁武ヱセヘネ首23販発ラノワ報京ぶせ計教ヲニユサ目投39作シワニ西8各如ね。質ルムフネ素熱とろや権写イルサ将図芸チスヒセ遊除なれイひ日見リヨ信期防滅票くい押関米ハ必能めレば会2各ンフか念化ぶかめん入米チラルリ飛園返樹ぼねえ。憲わフ帯瀬非どほら財案ざすき阪雄会テクマユ日計サ混子りぱ調調ぎひは人写ひぼンき角局コ指需ソチニ応子シヌヤ京件ぎじ治発ゅ阪融之押がらふ。
+
+歩そン算井にリこ領演むみさ上映へド金9曇室る岩人フ通載ールやス美社そじせ波法性メ世3安ラウシテ肝引レ面償ゆね辺策スチケヘ新紀ムワユ間聞需康びラばそ。盾トテ返校げほ際信告とえ産天タツイフ美対面ウチ記普すトぱ史企舞トヲヱケ渡芸トワ活闘7亜才滅絞ゃびかっ。書メ笠夫ゆ菱72墨ソサエ存図辞わぱ聞試イせドむ読目会レるんく職間キヤヱ上道レぴ約3提モ方少んじフ底焦茂微酸づしべ。"#);
+
+
+    }
+
+    #[test]
     fn test_encoder_normal() {
         assert!("".encode_with_encoding("LATIN1").unwrap().is_empty());
 
         let a = "哈哈";
         assert_eq!(a.encode_with_encoding("GBK").unwrap(), vec!(0xb9, 0xfe, 0xb9, 0xfe));
 
-        let b = iter::repeat(a).take(1024).collect::<Vec<&str>>().connect("");
+        let b = iter::repeat(a).take(1024).collect::<Vec<&str>>().join("");
 
         for ch in b.encode_with_encoding("GBK").unwrap().chunks(4) {
             assert_eq!(ch, &vec![0xb9, 0xfe, 0xb9, 0xfe][..]);

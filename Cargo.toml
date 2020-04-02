@@ -1,16 +1,17 @@
 [package]
-name    = "iconv"
+name = "iconv"
 description = "iconv bindings for Rust"
 version = "0.0.2"
 authors = [ "ShuYu Wang <andelf@gmail.com>" ]
 repository = "https://github.com/andelf/rust-iconv"
 license = "MIT"
 keywords = ["iconv"]
+edition = "2018"
 
 [lib]
-name       = "iconv"
-path       = "src/lib.rs"
+name = "iconv"
+path = "src/lib.rs"
 
 [dependencies]
-libc = "*"
-log = "*"
+libc = "0.2"
+log = "0.4"

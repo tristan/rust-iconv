@@ -15,4 +15,3 @@ bin/
 lib/
 target/
 .*.swp
-Cargo.lock
